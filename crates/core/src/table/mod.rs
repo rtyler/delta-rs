@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
-use object_store::{path::Path, ObjectStore};
+use object_store::{path::Path, ObjectStore, Error as ObjectStoreError};
 use serde::de::{Error, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -317,6 +318,22 @@ impl DeltaTable {
     /// loading the last checkpoint and incrementally applying each version since.
     pub async fn update(&mut self) -> Result<(), DeltaTableError> {
         self.update_incremental(None).await
+    }
+
+    /// Get the commit obj from the version
+    pub async fn get_obj_from_version(
+        &self,
+        current_version: i64,
+    ) -> Result<Bytes, DeltaTableError> {
+        match self.log_store.read_commit_entry(current_version).await {
+            Ok(bytes) => Ok(bytes.unwrap()),
+            Err(DeltaTableError::ObjectStore {
+                source: ObjectStoreError::NotFound { .. },
+            }) => {
+                return Err(DeltaTableError::DeltaLogNotFound(current_version));
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Get the list of actions for the next commit
