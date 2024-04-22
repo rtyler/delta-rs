@@ -19,13 +19,12 @@ use crate::kernel::Action;
 /// by middleware
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TransactionalContext<State> {
-    actions: Vec<Action>,
-    state: State,
+    pub(crate) state: State,
 }
 
 #[async_trait]
 pub(crate) trait Transactional<State>: Send + Sync {
-    async fn call(&self, ctx: TransactionalContext<State>) -> TransactionalContext<State>;
+    async fn call<'life>(&self, ctx: &'life mut TransactionalContext<State>) -> ();
 }
 
 pub(crate) type TransactionalRef<State> = Arc<dyn Transactional<State>>;
@@ -33,15 +32,4 @@ pub(crate) type TransactionalRef<State> = Arc<dyn Transactional<State>>;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_simple() {
-        struct Readonly {}
-        #[async_trait]
-        impl Transactional<()> for Readonly {
-            async fn call(&self, ctx: TransactionalContext<()>) -> TransactionalContext<()> {
-                ctx
-            }
-        }
-    }
 }

@@ -56,7 +56,10 @@ pub mod writer;
 /// The [Operation] trait defines common behaviors that all operations builders
 /// should have consistent
 pub(crate) trait Operation<State>: std::future::IntoFuture {
-    fn with(self, ware: middleware::TransactionalRef<State>) -> Self where Self: Sized {
+    fn with(self, _ware: middleware::TransactionalRef<State>) -> Self
+    where
+        Self: Sized,
+    {
         unimplemented!("Operations that want to use middleware must implement their own with!");
     }
 }

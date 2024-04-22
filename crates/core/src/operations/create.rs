@@ -14,11 +14,11 @@ use crate::kernel::{
     Action, DataType, Metadata, Protocol, ReaderFeatures, StructField, StructType, WriterFeatures,
 };
 use crate::logstore::{LogStore, LogStoreRef};
+use crate::operations::Operation;
 use crate::protocol::{DeltaOperation, SaveMode};
 use crate::table::builder::ensure_table_uri;
 use crate::table::config::DeltaConfigKey;
 use crate::{DeltaTable, DeltaTableBuilder};
-use crate::operations::Operation;
 
 #[derive(thiserror::Error, Debug)]
 enum CreateError {
@@ -71,7 +71,10 @@ pub struct CreateBuilder {
 }
 
 impl super::Operation<CreateMiddlewareState> for CreateBuilder {
-    fn with(mut self, ware: Arc<dyn super::middleware::Transactional<CreateMiddlewareState>>) -> Self {
+    fn with(
+        mut self,
+        ware: Arc<dyn super::middleware::Transactional<CreateMiddlewareState>>,
+    ) -> Self {
         println!("XXX");
         println!("Registering a middleware for CreateBuilder");
         self.middleware.push(ware.clone());
@@ -348,13 +351,14 @@ impl std::future::IntoFuture for CreateBuilder {
         use crate::operations::middleware::TransactionalContext;
         let this = self;
         Box::pin(async move {
-            let ctx: TransactionalContext<CreateMiddlewareState> = Default::default();
-            for middleware in &this.middleware {
-                middleware.call(ctx.clone()).await;
-            }
-
             let mode = this.mode;
             let app_metadata = this.metadata.clone().unwrap_or_default();
+
+            let mut ctx: TransactionalContext<CreateMiddlewareState> = Default::default();
+
+            for middleware in &this.middleware {
+                middleware.call(&mut ctx).await;
+            }
             let (mut table, actions, operation) = this.into_table_and_actions()?;
             let log_store = table.log_store();
 
@@ -553,9 +557,13 @@ mod tests {
         struct KevinMiddleware {}
         #[async_trait::async_trait]
         impl Transactional<CreateMiddlewareState> for KevinMiddleware {
-            async fn call(&self, ctx: TransactionalContext<CreateMiddlewareState>) -> TransactionalContext<CreateMiddlewareState> {
+            async fn call<'life>(
+                &self,
+                ctx: &'life mut TransactionalContext<CreateMiddlewareState>,
+            ) -> () {
                 println!("I have been summoned to invoke the Kevin");
-                ctx
+                println!("metadata: {:?}", ctx.state.metadata);
+                ctx.state.metadata.name = Some("kevin".into());
             }
         }
 
