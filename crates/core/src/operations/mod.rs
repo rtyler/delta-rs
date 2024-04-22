@@ -20,6 +20,7 @@ pub mod convert_to_delta;
 pub mod create;
 pub mod drop_constraints;
 pub mod filesystem_check;
+pub mod middleware;
 pub mod optimize;
 pub mod restore;
 pub mod transaction;
@@ -54,7 +55,11 @@ pub mod writer;
 
 /// The [Operation] trait defines common behaviors that all operations builders
 /// should have consistent
-pub(crate) trait Operation<State>: std::future::IntoFuture {}
+pub(crate) trait Operation<State>: std::future::IntoFuture {
+    fn with(self, ware: middleware::TransactionalRef<State>) -> Self where Self: Sized {
+        unimplemented!("Operations that want to use middleware must implement their own with!");
+    }
+}
 
 /// High level interface for executing commands against a DeltaTable
 pub struct DeltaOps(pub DeltaTable);

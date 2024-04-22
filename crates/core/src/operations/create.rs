@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use serde_json::Value;
+use tracing::log::*;
 
 use super::transaction::{CommitBuilder, TableReference, PROTOCOL};
 use crate::errors::{DeltaResult, DeltaTableError};
@@ -17,6 +18,7 @@ use crate::protocol::{DeltaOperation, SaveMode};
 use crate::table::builder::ensure_table_uri;
 use crate::table::config::DeltaConfigKey;
 use crate::{DeltaTable, DeltaTableBuilder};
+use crate::operations::Operation;
 
 #[derive(thiserror::Error, Debug)]
 enum CreateError {
@@ -44,8 +46,15 @@ impl From<CreateError> for DeltaTableError {
     }
 }
 
+/// State to pass around middleware
+#[derive(Clone, Debug, Default)]
+struct CreateMiddlewareState {
+    actions: Vec<Action>,
+    metadata: Metadata,
+}
+
 /// Build an operation to create a new [DeltaTable]
-#[derive(Debug, Clone)]
+//#[derive(Clone)]
 pub struct CreateBuilder {
     name: Option<String>,
     location: Option<String>,
@@ -58,9 +67,17 @@ pub struct CreateBuilder {
     log_store: Option<LogStoreRef>,
     configuration: HashMap<String, Option<String>>,
     metadata: Option<HashMap<String, Value>>,
+    middleware: Vec<Arc<dyn super::middleware::Transactional<CreateMiddlewareState>>>,
 }
 
-impl super::Operation<()> for CreateBuilder {}
+impl super::Operation<CreateMiddlewareState> for CreateBuilder {
+    fn with(mut self, ware: Arc<dyn super::middleware::Transactional<CreateMiddlewareState>>) -> Self {
+        println!("XXX");
+        println!("Registering a middleware for CreateBuilder");
+        self.middleware.push(ware.clone());
+        self
+    }
+}
 
 impl Default for CreateBuilder {
     fn default() -> Self {
@@ -83,6 +100,7 @@ impl CreateBuilder {
             log_store: None,
             configuration: Default::default(),
             metadata: Default::default(),
+            middleware: Default::default(),
         }
     }
 
@@ -327,8 +345,14 @@ impl std::future::IntoFuture for CreateBuilder {
     type IntoFuture = BoxFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
+        use crate::operations::middleware::TransactionalContext;
         let this = self;
         Box::pin(async move {
+            let ctx: TransactionalContext<CreateMiddlewareState> = Default::default();
+            for middleware in &this.middleware {
+                middleware.call(ctx.clone()).await;
+            }
+
             let mode = this.mode;
             let app_metadata = this.metadata.clone().unwrap_or_default();
             let (mut table, actions, operation) = this.into_table_and_actions()?;
@@ -519,5 +543,34 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(table.metadata().unwrap().id, first_id)
+    }
+
+    #[tokio::test]
+    async fn test_create_with_middleware() {
+        use crate::operations::middleware::*;
+
+        #[derive(Default)]
+        struct KevinMiddleware {}
+        #[async_trait::async_trait]
+        impl Transactional<CreateMiddlewareState> for KevinMiddleware {
+            async fn call(&self, ctx: TransactionalContext<CreateMiddlewareState>) -> TransactionalContext<CreateMiddlewareState> {
+                println!("I have been summoned to invoke the Kevin");
+                ctx
+            }
+        }
+
+        let table_schema = get_delta_schema();
+        let table = DeltaOps::new_in_memory()
+            .create()
+            .with(Arc::new(KevinMiddleware::default()))
+            .with_columns(table_schema.fields().clone())
+            .with_save_mode(SaveMode::Ignore)
+            .await
+            .unwrap();
+        assert_eq!(table.version(), 0);
+        assert_eq!(table.get_schema().unwrap(), &table_schema);
+
+        let metadata = table.metadata().expect("Failed to get metadata");
+        assert_eq!(Some("name"), metadata.name.as_deref());
     }
 }
