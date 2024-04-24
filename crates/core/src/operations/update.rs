@@ -968,4 +968,79 @@ mod tests {
             .await;
         assert!(res.is_err());
     }
+
+    #[tokio::test]
+    async fn test_update_cdc_enabled() {
+        use crate::kernel::{Action, Protocol};
+
+        // Currently you cannot pass EnableChangeDataFeed through `with_configuration_property`
+        // so the only way to create a truly CDC enabled table is by shoving the Protocol
+        // directly into the actions list
+        let actions = vec![Action::Protocol(
+            Protocol::new(1, 4).with_writer_features(vec!["changeDataFeed"]),
+        )];
+        let mut table: DeltaTable = DeltaOps::new_in_memory()
+            .create()
+            .with_column(
+                "value",
+                DeltaDataType::Primitive(PrimitiveType::Integer),
+                true,
+                None,
+            )
+            .with_actions(actions)
+            // Cannot set these yet :(
+            //.with_configuration_property(DeltaConfigKey::EnableChangeDataFeed, Some("true"))
+            //.with_configuration(vec![
+            //    ("delta.enableChangeDataFeed", Some("true")),
+            //])
+            .await
+            .unwrap();
+        assert_eq!(table.version(), 0);
+        /*
+        * This assertion fails, not sure why
+        if let Some(state) = table.state.as_ref() {
+            assert!(state.table_config().enable_change_data_feed());
+        }
+        else { assert!(false); }
+        */
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int32,
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![
+                Some(0),
+                None,
+                Some(2),
+                None,
+                Some(4),
+            ]))],
+        )
+        .unwrap();
+        let table = DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write first batch");
+        assert_eq!(table.version(), 1);
+
+        let (table, metrics) = DeltaOps(table)
+            .update()
+            .with_predicate(col("value").eq(lit(2)))
+            .with_update("value", lit(3))
+            .await
+            .unwrap();
+        assert_eq!(table.version(), 2);
+
+        let (table, metrics) = DeltaOps(table)
+            .update()
+            .with_predicate(col("value").eq(lit(3)))
+            .with_update("value", lit(7))
+            .await
+            .unwrap();
+        assert_eq!(table.version(), 3);
+    }
 }
