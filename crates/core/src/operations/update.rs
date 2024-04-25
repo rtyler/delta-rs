@@ -1042,5 +1042,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), 3);
+
+        let ctx = SessionContext::new();
+        let table = DeltaOps(table)
+            .load_cdf()
+            .with_session_ctx(ctx.clone())
+            .with_starting_version(0)
+            .build()
+            .await.expect("Failed to load CDF");
+
+        let batches =
+            collect_batches(table.output_partitioning().partition_count(), table, ctx).await
+        .expect("Failed to collect batches");
+
+        assert_batches_sorted_eq! {
+            ["+--------+------------------+-----------------+-------------------------+",
+             "| value  | _change_type     | _commit_version | _commit_timestamp       |",
+             "+--------+------------------+-----------------+-------------------------+",
+             "+--------+------------------+-----------------+-------------------------+"
+        ], &batches }
     }
+
+    use crate::delta_datafusion::cdf::DeltaCdfScan;
+    use crate::operations::collect_sendable_stream;
+    use datafusion::physical_plan::ExecutionPlan;
+
+    async fn collect_batches(
+        num_partitions: usize,
+        stream: DeltaCdfScan,
+        ctx: SessionContext,
+    ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+        let mut batches = vec![];
+        for p in 0..num_partitions {
+            let data: Vec<RecordBatch> =
+                collect_sendable_stream(stream.execute(p, ctx.task_ctx())?).await?;
+            batches.extend_from_slice(&data);
+        }
+        Ok(batches)
+    }
+
 }
