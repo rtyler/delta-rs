@@ -308,25 +308,25 @@ impl WriteBuilder {
         self
     }
 
+    /// Validate thta the write can proceed with the given schema or table
     async fn check_preconditions(&self) -> DeltaResult<Vec<Action>> {
+        let schema = if let Some(plan) = &self.input {
+            plan.schema().try_into()?
+        } else {
+            if self.batches.is_none() || self.batches.as_ref().unwrap().is_empty() {
+                return Err(WriteError::MissingData.into());
+            }
+            self.batches.as_ref().unwrap()[0].schema().try_into()?
+        };
+
         match &self.snapshot {
             Some(snapshot) => {
                 PROTOCOL.can_write_to(snapshot)?;
 
-                let schema: StructType = if let Some(plan) = &self.input {
-                    (plan.schema()).try_into()?
-                } else if let Some(batches) = &self.batches {
-                    if batches.is_empty() {
-                        return Err(WriteError::MissingData.into());
-                    }
-                    (batches[0].schema()).try_into()?
-                } else {
-                    return Err(WriteError::MissingData.into());
-                };
-
                 if self.schema_mode.is_none() {
                     PROTOCOL.check_can_write_timestamp_ntz(snapshot, &schema)?;
                 }
+
                 match self.mode {
                     SaveMode::ErrorIfExists => {
                         Err(WriteError::AlreadyExists(self.log_store.root_uri()).into())
@@ -335,16 +335,6 @@ impl WriteBuilder {
                 }
             }
             None => {
-                let schema: StructType = if let Some(plan) = &self.input {
-                    Ok(plan.schema().try_into()?)
-                } else if let Some(batches) = &self.batches {
-                    if batches.is_empty() {
-                        return Err(WriteError::MissingData.into());
-                    }
-                    Ok(batches[0].schema().try_into()?)
-                } else {
-                    Err(WriteError::MissingData)
-                }?;
                 let mut builder = CreateBuilder::new()
                     .with_log_store(self.log_store.clone())
                     .with_columns(schema.fields().cloned())
@@ -2015,7 +2005,6 @@ mod tests {
     #[tokio::test]
     async fn test_replace_where_partitioned() {
         let schema = get_arrow_schema(&None);
-
         let batch = get_record_batch(None, false);
 
         let table = DeltaOps::new_in_memory()
@@ -2318,6 +2307,29 @@ mod tests {
             .filter(|action| matches!(action, &&Action::Cdc(_)))
             .collect_vec();
         assert!(!cdc_actions.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_check_preconditions_empty_input() -> DeltaResult<()> {
+        let writer = DeltaOps::new_in_memory().write(vec![]);
+        let pre_check = writer.check_preconditions().await;
+        assert!(
+            pre_check.is_err(),
+            "The pre-check should fail on an empty batch"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_check_preconditions_simple_input() -> DeltaResult<()> {
+        let batch = get_record_batch(None, false);
+        let writer = DeltaOps::new_in_memory().write(vec![batch]);
+        let pre_check = writer.check_preconditions().await;
+        assert!(
+            pre_check.is_ok(),
+            "The pre-check should not fail on a simple batch"
+        );
         Ok(())
     }
 }
