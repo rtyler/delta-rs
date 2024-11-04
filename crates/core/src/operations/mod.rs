@@ -157,7 +157,7 @@ impl DeltaOps {
     /// Write data to Delta table
     #[cfg(feature = "datafusion")]
     #[must_use]
-    pub fn write(self, batches: impl IntoIterator<Item = RecordBatch> + Send) -> WriteBuilder {
+    pub fn write(self, batches: impl IntoIterator<Item = RecordBatch>) -> WriteBuilder {
         WriteBuilder::new(self.0.log_store, self.0.state).with_input_batches(batches)
     }
 
