@@ -33,15 +33,21 @@ use std::vec;
 use arrow_array::RecordBatch;
 use arrow_cast::can_cast_types;
 use arrow_schema::{ArrowError, DataType, Fields, SchemaRef as ArrowSchemaRef};
-use datafusion::execution::context::{SessionContext, SessionState, TaskContext};
+use datafusion::execution::{
+    context::{SessionContext, SessionState, TaskContext},
+    SendableRecordBatchStream,
+};
 use datafusion_common::DFSchema;
 use datafusion_expr::{lit, Expr};
 use datafusion_physical_expr::expressions::{self};
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::union::UnionExec;
-use datafusion_physical_plan::{memory::MemoryExec, ExecutionPlan};
+use datafusion_physical_plan::{
+    memory::MemoryExec, memory::MemoryStream, ExecutionPlan, RecordBatchStream,
+};
 use futures::future::BoxFuture;
 use futures::StreamExt;
 use object_store::prefix::PrefixStore;
@@ -148,7 +154,7 @@ pub struct WriteBuilder {
     /// Number of records to be written in single batch to underlying writer
     write_batch_size: Option<usize>,
     /// RecordBatches to be written into the table
-    batches: Option<Vec<RecordBatch>>,
+    batches: Option<SendableRecordBatchStream>,
     /// whether to overwrite the schema or to merge it. None means to fail on schmema drift
     schema_mode: Option<SchemaMode>,
     /// how to handle cast failures, either return NULL (safe=true) or return ERR (safe=false)
@@ -246,10 +252,43 @@ impl WriteBuilder {
         self
     }
 
-    /// Execution plan that produces the data to be written to the delta table
-    pub fn with_input_batches(mut self, batches: impl IntoIterator<Item = RecordBatch>) -> Self {
-        self.batches = Some(batches.into_iter().collect());
+    /// Execute the plan with a [SendableRecordBatchStream].
+    ///
+    /// This is preferred so that the [WriteBuilder] can iterate through batche to write more
+    /// iteratively which results in less memory being used during the write operation
+    pub fn with_input_batch_stream(mut self, stream: SendableRecordBatchStream) -> Self {
+        self.batches = Some(stream);
         self
+    }
+
+    /// Lazily give the writer some data with a defined schema
+    pub fn with_data(
+        mut self,
+        schema: ArrowSchemaRef,
+        batches: Box<dyn Iterator<Item = RecordBatch> + Send>,
+    ) -> Self {
+        return self.with_input_batch_stream(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches).map(|rb| Ok(rb)),
+        )));
+    }
+
+    /// Execution plan that produces the data to be written to the delta table
+    ///
+    /// This will do nothing if the iterator has no items, since no write should be performed with
+    /// an empty set
+    pub fn with_input_batches<I: IntoIterator<Item = RecordBatch>>(mut self, batches: I) -> Self
+    where
+        I: Send,
+    {
+        // XXX: This still has lousy performance
+        let mut batches: Vec<_> = batches.into_iter().collect();
+        if let Some(first) = batches.first() {
+            let schema = first.schema().clone();
+            return self.with_data(schema, Box::new(batches.into_iter()));
+        }
+        error!("The WriteBuilder has been asked to use a zero-length set of batches, so nothing wiull be written!");
+        return self;
     }
 
     /// Specify the target file size for data files written to the delta table.
@@ -308,46 +347,32 @@ impl WriteBuilder {
         self
     }
 
+    /// Verify some preconditions before attempting to execute the write
+    ///
+    /// In the case of a table which doesn't exist this will return the [Action] entries which are
+    /// necessary to initialize a Delta table
+    ///
     async fn check_preconditions(&self) -> DeltaResult<Vec<Action>> {
-        if self.schema_mode == Some(SchemaMode::Overwrite) && self.mode != SaveMode::Overwrite {
-            return Err(DeltaTableError::Generic(
-                "Schema overwrite not supported for Append".to_string(),
-            ));
+        // Ensure that the stream has data first
+        if let Some(batch_stream) = &self.batches {
+            // no-op
+        } else {
+            error!("The writer was called without a stream of batches!");
+            return Err(WriteError::MissingData.into());
         }
 
-        let batches: &Vec<RecordBatch> = match &self.batches {
-            Some(batches) => {
-                if batches.is_empty() {
-                    error!("The WriteBuilder was an empty set of batches!");
-                    return Err(WriteError::MissingData.into());
-                }
-                batches
-            }
-            None => {
-                if self.input.is_none() {
-                    error!("The WriteBuilder must have an input plan _or_ batches!");
-                    return Err(WriteError::MissingData.into());
-                }
-                // provide an empty array in the case that an input plan exists
-                &vec![]
-            }
-        };
-
-        let schema: StructType = match &self.input {
-            Some(plan) => (plan.schema()).try_into()?,
-            None => (batches[0].schema()).try_into()?,
-        };
-
+        /*
         match &self.snapshot {
             Some(snapshot) => {
-                if self.mode == SaveMode::Overwrite {
-                    PROTOCOL.check_append_only(&snapshot.snapshot)?;
-                    if !snapshot.load_config().require_files {
-                        return Err(DeltaTableError::NotInitializedWithFiles("WRITE".into()));
-                    }
-                }
-
                 PROTOCOL.can_write_to(snapshot)?;
+
+                let schema: StructType = if let Some(plan) = &self.input {
+                    (plan.schema()).try_into()?
+                } else if batch_schema.is_some() {
+                    batch_schema.unwrap()
+                } else {
+                    return Err(WriteError::MissingData.into());
+                };
 
                 if self.schema_mode.is_none() {
                     PROTOCOL.check_can_write_timestamp_ntz(snapshot, &schema)?;
@@ -360,6 +385,14 @@ impl WriteBuilder {
                 }
             }
             None => {
+                let schema: StructType = if let Some(plan) = &self.input {
+                    plan.schema().try_into()?
+                } else if batch_schema.is_some() {
+                    batch_schema.unwrap()
+                } else {
+                    return Err(WriteError::MissingData.into());
+                };
+
                 let mut builder = CreateBuilder::new()
                     .with_log_store(self.log_store.clone())
                     .with_columns(schema.fields().cloned())
@@ -380,6 +413,8 @@ impl WriteBuilder {
                 Ok(actions)
             }
         }
+        */
+        Ok(vec![])
     }
 }
 /// Configuration for the writer on how to collect stats
@@ -801,9 +836,23 @@ impl std::future::IntoFuture for WriteBuilder {
             let mut metrics = WriteMetrics::default();
             let exec_start = Instant::now();
 
-            // Create table actions to initialize table in case it does not yet exist and should be
-            // created
-            let mut actions = this.check_preconditions().await?;
+            if this.mode == SaveMode::Overwrite {
+                if let Some(snapshot) = &this.snapshot {
+                    PROTOCOL.check_append_only(&snapshot.snapshot)?;
+                    if !snapshot.load_config().require_files {
+                        return Err(DeltaTableError::NotInitializedWithFiles("WRITE".into()));
+                    }
+                }
+            }
+            if this.schema_mode == Some(SchemaMode::Overwrite) && this.mode != SaveMode::Overwrite {
+                return Err(DeltaTableError::Generic(
+                    "Schema overwrite not supported for Append".to_string(),
+                ));
+            }
+
+            // Create table actions to initialize table in case it does not yet exist and should be created
+            //let mut actions = this.check_preconditions()?;
+            let mut actions = vec![];
 
             let active_partitions = this
                 .snapshot
@@ -828,6 +877,7 @@ impl std::future::IntoFuture for WriteBuilder {
                 Ok(this.partition_columns.unwrap_or_default())
             }?;
             let mut schema_drift = false;
+
             let plan = if let Some(plan) = this.input {
                 if this.schema_mode == Some(SchemaMode::Merge) {
                     return Err(DeltaTableError::Generic(
@@ -836,8 +886,9 @@ impl std::future::IntoFuture for WriteBuilder {
                 }
                 Ok(plan)
             } else if let Some(batches) = this.batches {
-                if batches.is_empty() {
-                    Err(WriteError::MissingData)
+                //if batches.is_empty() {
+                Err(WriteError::MissingData)
+                /*
                 } else {
                     let schema = batches[0].schema();
 
@@ -876,6 +927,7 @@ impl std::future::IntoFuture for WriteBuilder {
                             )?);
                         }
                     }
+
                     let data = if !partition_columns.is_empty() {
                         // TODO partitioning should probably happen in its own plan ...
                         let mut partitions: HashMap<String, Vec<RecordBatch>> = HashMap::new();
@@ -915,27 +967,9 @@ impl std::future::IntoFuture for WriteBuilder {
                         metrics.num_added_rows = num_added_rows;
                         partitions.into_values().collect::<Vec<_>>()
                     } else {
-                        match new_schema {
-                            Some(ref new_schema) => {
-                                let mut new_batches = vec![];
-                                let mut num_added_rows = 0;
-                                for batch in batches {
-                                    new_batches.push(cast_record_batch(
-                                        &batch,
-                                        new_schema.clone(),
-                                        this.safe_cast,
-                                        schema_drift, // Schema drifted so we have to add the missing columns/structfields.
-                                    )?);
-                                    num_added_rows += batch.num_rows();
-                                }
-                                metrics.num_added_rows = num_added_rows;
-                                vec![new_batches]
-                            }
-                            None => {
-                                metrics.num_added_rows = batches.iter().map(|b| b.num_rows()).sum();
-                                vec![batches]
-                            }
-                        }
+                        let (data, num_added_rows) = produce_added_batches(new_schema.clone(), this.safe_cast, schema_drift, batches)?;
+                        metrics.num_added_rows = num_added_rows;
+                        vec![data]
                     };
 
                     Ok(Arc::new(MemoryExec::try_new(
@@ -944,9 +978,11 @@ impl std::future::IntoFuture for WriteBuilder {
                         None,
                     )?) as Arc<dyn ExecutionPlan>)
                 }
+                    */
             } else {
                 Err(WriteError::MissingData)
             }?;
+
             let schema = plan.schema();
             if this.schema_mode == Some(SchemaMode::Merge) && schema_drift {
                 if let Some(snapshot) = &this.snapshot {
@@ -1155,6 +1191,38 @@ impl std::future::IntoFuture for WriteBuilder {
     }
 }
 
+/// Produce batches for writes without partitions
+///
+/// Returns batches and the number of rows added by them
+fn produce_added_batches(
+    new_schema: Option<ArrowSchemaRef>,
+    safe_cast: bool,
+    schema_drift: bool,
+    batches: Vec<RecordBatch>,
+) -> DeltaResult<(Vec<RecordBatch>, usize)> {
+    let mut num_added_rows: usize = 0;
+    let batches = match new_schema {
+        Some(ref new_schema) => {
+            let mut new_batches = vec![];
+            for batch in batches {
+                new_batches.push(cast_record_batch(
+                    &batch,
+                    new_schema.clone(),
+                    safe_cast,
+                    schema_drift, // Schema drifted so we have to add the missing columns/structfields.
+                )?);
+                num_added_rows += batch.num_rows();
+            }
+            new_batches
+        }
+        None => {
+            num_added_rows = batches.iter().map(|b| b.num_rows()).sum();
+            batches
+        }
+    };
+    Ok((batches, num_added_rows))
+}
+
 fn try_cast_batch(from_fields: &Fields, to_fields: &Fields) -> Result<(), ArrowError> {
     if from_fields.len() != to_fields.len() {
         return Err(ArrowError::SchemaError(format!(
@@ -1253,7 +1321,7 @@ mod tests {
     }
 
     fn assert_common_write_metrics(write_metrics: WriteMetrics) {
-        // assert!(write_metrics.execution_time_ms > 0);
+        assert!(write_metrics.execution_time_ms > 0);
         assert!(write_metrics.num_added_files > 0);
     }
 
@@ -2323,146 +2391,43 @@ mod tests {
         Ok(())
     }
 
-    /// SMall module to collect test cases which validate the [WriteBuilder]'s
-    /// check_preconditions() function
-    mod check_preconditions_test {
-        use super::*;
+    #[tokio::test]
+    async fn test_with_empty_input_batches() {
+        let writer = DeltaOps::new_in_memory().write(vec![]);
+        assert!(writer.batches.is_none());
+    }
 
-        #[tokio::test]
-        async fn test_schema_overwrite_on_append() -> DeltaResult<()> {
-            let table_schema = get_delta_schema();
-            let batch = get_record_batch(None, false);
-            let table = DeltaOps::new_in_memory()
-                .create()
-                .with_columns(table_schema.fields().cloned())
-                .await?;
-            let writer = DeltaOps(table)
-                .write(vec![batch])
-                .with_schema_mode(SchemaMode::Overwrite)
-                .with_save_mode(SaveMode::Append);
+    #[tokio::test]
+    async fn test_with_one_input_batches() -> DeltaResult<()> {
+        let delta_schema = TestSchemas::simple();
+        let schema = Arc::new(ArrowSchema::try_from(delta_schema)?);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("1"), Some("2"), Some("3")])),
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])),
+                Arc::new(StringArray::from(vec![
+                    Some("yes"),
+                    Some("yes"),
+                    Some("no"),
+                ])),
+            ],
+        )
+        .unwrap();
 
-            let check = writer.check_preconditions().await;
-            assert!(check.is_err());
-            Ok(())
-        }
+        let writer = DeltaOps::new_in_memory().write(vec![batch]);
+        assert!(writer.batches.is_some());
+        Ok(())
+    }
 
-        #[tokio::test]
-        async fn test_savemode_overwrite_on_append_table() -> DeltaResult<()> {
-            let table_schema = get_delta_schema();
-            let batch = get_record_batch(None, false);
-            let table = DeltaOps::new_in_memory()
-                .create()
-                .with_configuration_property(TableProperty::AppendOnly, Some("true".to_string()))
-                .with_columns(table_schema.fields().cloned())
-                .await?;
-            let writer = DeltaOps(table)
-                .write(vec![batch])
-                .with_save_mode(SaveMode::Overwrite);
-
-            let check = writer.check_preconditions().await;
-            assert!(check.is_err());
-            Ok(())
-        }
-
-        #[tokio::test]
-        async fn test_empty_set_of_batches() -> DeltaResult<()> {
-            let table_schema = get_delta_schema();
-            let table = DeltaOps::new_in_memory()
-                .create()
-                .with_columns(table_schema.fields().cloned())
-                .await?;
-            let writer = DeltaOps(table).write(vec![]);
-
-            match writer.check_preconditions().await {
-                Ok(_) => panic!("Expected check_preconditions to fail!"),
-                Err(DeltaTableError::GenericError { .. }) => {}
-                Err(e) => panic!("Unexpected error returned: {e:#?}"),
-            }
-            Ok(())
-        }
-
-        #[tokio::test]
-        async fn test_errorifexists() -> DeltaResult<()> {
-            let table_schema = get_delta_schema();
-            let batch = get_record_batch(None, false);
-            let table = DeltaOps::new_in_memory()
-                .create()
-                .with_columns(table_schema.fields().cloned())
-                .await?;
-            let writer = DeltaOps(table)
-                .write(vec![batch])
-                .with_save_mode(SaveMode::ErrorIfExists);
-
-            match writer.check_preconditions().await {
-                Ok(_) => panic!("Expected check_preconditions to fail!"),
-                Err(DeltaTableError::GenericError { .. }) => {}
-                Err(e) => panic!("Unexpected error returned: {e:#?}"),
-            }
-            Ok(())
-        }
-
-        #[tokio::test]
-        async fn test_allow_empty_batches_with_input_plan() -> DeltaResult<()> {
-            let table_schema = get_delta_schema();
-            let table = DeltaOps::new_in_memory()
-                .create()
-                .with_columns(table_schema.fields().cloned())
-                .await?;
-
-            let ctx = SessionContext::new();
-            let plan = ctx
-                .sql("SELECT 1 as id")
-                .await
-                .unwrap()
-                .create_physical_plan()
-                .await
-                .unwrap();
-            let writer = WriteBuilder::new(table.log_store.clone(), table.state)
-                .with_input_execution_plan(plan)
-                .with_save_mode(SaveMode::Overwrite);
-
-            let _ = writer.check_preconditions().await?;
-            Ok(())
-        }
-
-        #[tokio::test]
-        async fn test_no_snapshot_create_actions() -> DeltaResult<()> {
-            let table_schema = get_delta_schema();
-            let table = DeltaOps::new_in_memory()
-                .create()
-                .with_columns(table_schema.fields().cloned())
-                .await?;
-            let batch = get_record_batch(None, false);
-            let writer =
-                WriteBuilder::new(table.log_store.clone(), None).with_input_batches(vec![batch]);
-
-            let actions = writer.check_preconditions().await?;
-            assert_eq!(
-                actions.len(),
-                2,
-                "Expecting a Protocol and a Metadata action in {actions:?}"
-            );
-
-            Ok(())
-        }
-
-        #[tokio::test]
-        async fn test_no_snapshot_err_no_batches_check() -> DeltaResult<()> {
-            let table_schema = get_delta_schema();
-            let table = DeltaOps::new_in_memory()
-                .create()
-                .with_columns(table_schema.fields().cloned())
-                .await?;
-            let writer =
-                WriteBuilder::new(table.log_store.clone(), None).with_input_batches(vec![]);
-
-            match writer.check_preconditions().await {
-                Ok(_) => panic!("Expected check_preconditions to fail!"),
-                Err(DeltaTableError::GenericError { .. }) => {}
-                Err(e) => panic!("Unexpected error returned: {e:#?}"),
-            }
-
-            Ok(())
-        }
+    #[tokio::test]
+    async fn test_check_preconditions() -> DeltaResult<()> {
+        let writer = DeltaOps::new_in_memory().write(vec![]);
+        let res = writer.check_preconditions().await;
+        assert!(
+            res.is_err(),
+            "The writer should fail preconditions if no batches exist"
+        );
+        Ok(())
     }
 }

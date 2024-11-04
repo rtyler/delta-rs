@@ -1911,8 +1911,8 @@ fn write_to_deltalake(
     commit_properties: Option<PyCommitProperties>,
     post_commithook_properties: Option<PyPostCommitHookProperties>,
 ) -> PyResult<()> {
+    println!("THE NEW THING IS RUNNING");
     py.allow_threads(|| {
-        let batches = data.0.map(|batch| batch.unwrap()).collect::<Vec<_>>();
         let save_mode = mode.parse().map_err(PythonError::from)?;
 
         let options = storage_options.clone().unwrap_or_default();
@@ -1925,7 +1925,7 @@ fn write_to_deltalake(
             .map_err(PythonError::from)?
         };
 
-        let mut builder = table.write(batches).with_save_mode(save_mode);
+        let mut builder = table.write(data.0.map(|batch| batch.unwrap())).with_save_mode(save_mode);
         if let Some(schema_mode) = schema_mode {
             builder = builder.with_schema_mode(schema_mode.parse().map_err(PythonError::from)?);
         }
