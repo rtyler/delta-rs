@@ -47,6 +47,7 @@ use futures::StreamExt;
 use object_store::prefix::PrefixStore;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::log::*;
 
 use super::cdc::should_write_cdc;
@@ -72,8 +73,6 @@ use crate::table::state::DeltaTableState;
 use crate::table::Constraint as DeltaConstraint;
 use crate::writer::record_batch::divide_by_partition_values;
 use crate::DeltaTable;
-
-use tokio::sync::mpsc::Sender;
 
 #[derive(thiserror::Error, Debug)]
 enum WriteError {
@@ -149,6 +148,10 @@ pub struct WriteBuilder {
     write_batch_size: Option<usize>,
     /// RecordBatches to be written into the table
     batches: Option<Vec<RecordBatch>>,
+    /// [Receiver] which will produce [RecordBatch] for a thread-safe stream-oriented write operation
+    batch_rx: Option<Receiver<RecordBatch>>,
+    /// [Sender] which is used when streaming [RecordBatch] with `batch_rx`
+    batch_tx: Option<Sender<RecordBatch>>,
     /// whether to overwrite the schema or to merge it. None means to fail on schmema drift
     schema_mode: Option<SchemaMode>,
     /// how to handle cast failures, either return NULL (safe=true) or return ERR (safe=false)
@@ -196,6 +199,8 @@ impl WriteBuilder {
             target_file_size: None,
             write_batch_size: None,
             batches: None,
+            batch_rx: None,
+            batch_tx: None,
             safe_cast: false,
             schema_mode: None,
             writer_properties: None,
@@ -246,9 +251,27 @@ impl WriteBuilder {
         self
     }
 
-    /// Execution plan that produces the data to be written to the delta table
+    /// [IntoIterator] impmlementation which can produce [RecordBatch] to be written to the Delta
+    /// table.
+    ///
+    /// Note that this will first collect batches into memory before writing them out!
     pub fn with_input_batches(mut self, batches: impl IntoIterator<Item = RecordBatch>) -> Self {
         self.batches = Some(batches.into_iter().collect());
+        self
+    }
+
+    /// [Receiver] side of a [tokio::sync::mpsc::channel] which will receive [RecordBatch]
+    /// structs streamed from the caller.
+    ///
+    /// This can be used to stream [RecordBatch] from a data producer without requiring data to be
+    /// collected into memory before writing to the Delta table.
+    ///
+    /// The function should be given a clone of the [Sender] too, since there are some precondition
+    /// checks which require _receiving_ a batch to inspect its contents before processing the
+    /// write. Having the [Sender] allows for effective re-queuing of some batches as needed
+    pub fn with_batch_stream(mut self, rx: Receiver<RecordBatch>, tx: Sender<RecordBatch>) -> Self {
+        self.batch_rx = Some(rx);
+        self.batch_tx = Some(tx);
         self
     }
 
@@ -309,9 +332,22 @@ impl WriteBuilder {
     }
 
     /// Validate thta the write can proceed with the given schema or table
-    async fn check_preconditions(&self) -> DeltaResult<Vec<Action>> {
+    async fn check_preconditions(&mut self) -> DeltaResult<Vec<Action>> {
         let schema = if let Some(plan) = &self.input {
             plan.schema().try_into()?
+        } else if let Some(rx) = self.batch_rx.as_mut() {
+            if let Some(batch) = rx.recv().await {
+                // This has taken a value from the channel, since there's no peek() possible, we
+                // need to grab the schema from this batch and then shove it back into the channel
+                //
+                //  ¯\_(ツ)_/¯
+                let schema = batch.schema().try_into()?;
+                self.batch_tx.as_mut().unwrap().send(batch).await.expect("Failed to re-send batch!");
+                schema
+            }
+            else {
+                return Err(WriteError::MissingData.into());
+            }
         } else {
             if self.batches.is_none() || self.batches.as_ref().unwrap().is_empty() {
                 return Err(WriteError::MissingData.into());
@@ -770,7 +806,7 @@ impl std::future::IntoFuture for WriteBuilder {
     type IntoFuture = BoxFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
-        let this = self;
+        let mut this = self;
 
         Box::pin(async move {
             let mut metrics = WriteMetrics::default();

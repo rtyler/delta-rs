@@ -1911,8 +1911,14 @@ fn write_to_deltalake(
     commit_properties: Option<PyCommitProperties>,
     post_commithook_properties: Option<PyPostCommitHookProperties>,
 ) -> PyResult<()> {
+    use deltalake::operations::write::WriteBuilder;
+    use tokio::sync::mpsc::channel;
+    // The channel is to allow for safe streaming of [RecordBatch] entities into the Rust future
+    // which will be executing the write
+    let (tx, rx) = channel(1);
+
     py.allow_threads(|| {
-        let batches = data.0.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+        let reader: ArrowArrayStreamReader = data.0;
         let save_mode = mode.parse().map_err(PythonError::from)?;
 
         let options = storage_options.clone().unwrap_or_default();
@@ -1925,7 +1931,20 @@ fn write_to_deltalake(
             .map_err(PythonError::from)?
         };
 
-        let mut builder = table.write(batches).with_save_mode(save_mode);
+        let mut builder = WriteBuilder::new(table.0.log_store().clone(), table.0.state)
+            .with_save_mode(save_mode)
+            .with_batch_stream(rx, tx.clone());
+
+        // Create a sender task for streaming the RecordBatch objects from "here" into the
+        // WriteBuilder future
+        rt().spawn(async move {
+            for batch in reader {
+                if let Ok(batch) = batch {
+                    tx.send(batch).await.expect("Failed to send a batch oh no");
+                }
+            }
+        });
+
         if let Some(schema_mode) = schema_mode {
             builder = builder.with_schema_mode(schema_mode.parse().map_err(PythonError::from)?);
         }
