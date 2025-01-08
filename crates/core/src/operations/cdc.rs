@@ -31,6 +31,7 @@ impl CDCTracker {
         let pre_df = self.pre_dataframe;
         let post_df = self.post_dataframe;
 
+
         // There is certainly a better way to do this other than stupidly cloning data for diffing
         // purposes, but this is the quickest and easiest way to "diff" the two sets of batches
         let preimage = pre_df.clone().except(post_df.clone())?;

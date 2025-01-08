@@ -909,6 +909,7 @@ impl std::future::IntoFuture for WriteBuilder {
                     }
                 }
                 let data = if !partition_columns.is_empty() {
+                    println!("This data looks partitioned: {partition_columns:?}");
                     // TODO partitioning should probably happen in its own plan ...
                     let mut partitions: HashMap<String, Vec<RecordBatch>> = HashMap::new();
                     let mut num_partitions = 0;
@@ -945,6 +946,7 @@ impl std::future::IntoFuture for WriteBuilder {
                     }
                     metrics.num_partitions = num_partitions;
                     metrics.num_added_rows = num_added_rows;
+                    println!("partitions: {partitions:?}");
                     partitions.into_values().collect::<Vec<_>>()
                 } else {
                     match new_schema {
@@ -969,12 +971,14 @@ impl std::future::IntoFuture for WriteBuilder {
                         }
                     }
                 };
+                let _ = arrow::util::pretty::print_batches(&data[0]);
                 let mut robots: Vec<Arc<RwLock<dyn LazyBatchGenerator>>> = vec![];
                 // Let the robots do the heavy lifting here. Each partition gets its own
                 for batch_vec in data {
                     let robot = InMemoryGenerator::from(batch_vec);
                     robots.push(Arc::new(RwLock::new(robot)));
                 }
+                println!("Starting LazyMemoryExec with {} generators", robots.len());
 
                 Arc::new(LazyMemoryExec::try_new(
                     new_schema.unwrap_or(schema).clone(),
@@ -2307,6 +2311,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), 2);
+
+        let actual = get_data_sorted(&table, "id,value,modified").await;
+        let _ = arrow::util::pretty::print_batches(&actual);
 
         let ctx = SessionContext::new();
         let cdf_scan = DeltaOps(table.clone())
