@@ -147,3 +147,24 @@ def test_read_checkpointed_features_table(tmp_path: pathlib.Path):
     dt.create_checkpoint()
 
     assert_spark_read_equal(data, str(tmp_path), ["timestamp"])
+
+@pytest.mark.pyspark
+@pytest.mark.pyarrow
+@pytest.mark.integration
+def test_read_delta_4_timestamps(tmp_path: pathlib.Path):
+    """
+    https://github.com/delta-io/delta-rs/issues/3782
+    """
+
+    spark.conf.set("spark.sql.session.timeZone", "CET")
+    df = spark.sql("""
+    with ts as (
+        select make_timestamp(1800, 1, 1, 1, 1, 1) as ts
+    )
+    select date_format(ts, 'yyyy-MM-dd HH:mm:ss XXXX') as ts_string, ts from ts
+    """)
+    df.write.format("delta").save(str(tmp_path))
+    df.show(truncate=False)
+
+    dt = DeltaTable(tmp_path)
+    print(dt.schema())
