@@ -55,8 +55,8 @@ jobs:
       - name: Build and install deltalake
         run: make develop
 
-      - name: Run tests
-        run: uv run --no-sync pytest -n auto -m '((s3 or azure) and integration) or not integration and not benchmark and not no_pyarrow' --doctest-modules
+      - name: Run integration tests
+        run: make test-ingration
 
       - name: Test without pandas
         run: |

@@ -7,6 +7,7 @@ from deltalake._internal import DeltaError
 
 
 @pytest.mark.unitycatalog_databricks
+@pytest.mark.unity
 @pytest.mark.pyarrow
 @pytest.mark.integration
 @pytest.mark.timeout(timeout=10, method="thread")
@@ -30,6 +31,7 @@ def test_uc_read_deltatable():
 
 
 @pytest.mark.unitycatalog_oss
+@pytest.mark.unity
 @pytest.mark.integration
 @pytest.mark.pyarrow
 @pytest.mark.timeout(timeout=10, method="thread")

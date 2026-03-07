@@ -69,6 +69,11 @@ unit-test: ## Run unit test
 	$(info --- Run Python unit-test ---)
 	uv run --no-sync pytest -q -n auto --doctest-modules
 
+.PHONY: test-integration
+test-integration: ## Run most of the integration tests except lakefs/unity, make sure podman-compose is running
+	$(info --- Run Python integration tests ----)
+	uv run --no-sync pytest -q -n auto -m "integration and not lakefs and not unity" --doctest-modules
+
 .PHONY: test-cov
 test-cov: ## Create coverage report
 	$(info --- Run Python unit-test ---)
