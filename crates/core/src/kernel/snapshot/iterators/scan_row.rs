@@ -31,6 +31,7 @@ use crate::kernel::snapshot::stats_projection::{
     FIELD_PARTITION_VALUES_PARSED, FIELD_STATS, FIELD_STATS_PARSED, FileStatsMaterialization,
     StatsSourcePolicy,
 };
+use crate::kernel::snapshot::iterators::FIELD_NAME_DATA_CHANGE;
 use crate::{DeltaResult, DeltaTableError};
 
 pin_project! {
@@ -198,6 +199,16 @@ fn parse_stats_column_impl(
             false,
         )));
         columns.push(Arc::new(partition_array));
+    }
+
+    // Propagate `dataChange` when the upstream batch already carries it as a top-level
+    // boolean column.  The kernel's SCAN_ROW_SCHEMA omits this field; once the kernel
+    // exposes it (upstream PR required) or when a test directly injects the column, it
+    // will be preserved here so that `LogicalFileView::data_change()` returns the
+    // correct value instead of the conservative `true` default.
+    if let Some((dc_idx, dc_field)) = batch.schema_ref().column_with_name(FIELD_NAME_DATA_CHANGE) {
+        fields.push(dc_field.clone().into());
+        columns.push(batch.column(dc_idx).clone());
     }
 
     Ok(RecordBatch::try_new(

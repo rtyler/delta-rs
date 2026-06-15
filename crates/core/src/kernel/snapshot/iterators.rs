@@ -37,6 +37,14 @@ const FIELD_NAME_STATS: &str = "stats";
 const FIELD_NAME_STATS_PARSED: &str = "stats_parsed";
 const FIELD_NAME_PARTITION_VALUES_PARSED: &str = "partitionValues_parsed";
 const FIELD_NAME_DELETION_VECTOR: &str = "deletionVector";
+/// Column name for the `dataChange` flag carried through scan row batches.
+///
+/// The kernel's `SCAN_ROW_SCHEMA` does not include this field; it is appended by
+/// [`crate::kernel::snapshot::iterators::scan_row::parse_stats_column_impl`] when the
+/// source log batch exposes `add.dataChange`.  Until that mechanism is wired up, the
+/// column will be absent and [`LogicalFileView::data_change`] returns `true` as a
+/// conservative default.
+pub(crate) const FIELD_NAME_DATA_CHANGE: &str = "dataChange";
 
 const STATS_FIELD_NUM_RECORDS: &str = "numRecords";
 const STATS_FIELD_MIN_VALUES: &str = "minValues";
@@ -297,6 +305,27 @@ impl LogicalFileView {
             .flatten()
     }
 
+    /// Returns the `dataChange` flag from the underlying Add action.
+    ///
+    /// When `true` the file was added by a data-modifying operation (insert, update, delete).
+    /// When `false` the file was produced by a rewrite that does not change the logical table
+    /// contents (e.g. OPTIMIZE / compaction).
+    ///
+    /// # Implementation note
+    ///
+    /// The kernel's `SCAN_ROW_SCHEMA` does not include `dataChange`, so this value is only
+    /// available when the scan row batch has been augmented with a top-level `"dataChange"`
+    /// boolean column.  When the column is absent this method returns `true` as a conservative
+    /// default (keeping existing behaviour).  Once the kernel exposes the field the column will
+    /// be populated automatically and the correct value will be returned.
+    pub fn data_change(&self) -> bool {
+        self.files
+            .column_by_name(FIELD_NAME_DATA_CHANGE)
+            .and_then(|col| col.as_boolean_opt())
+            .map(|arr| arr.is_valid(self.index) && arr.value(self.index))
+            .unwrap_or(true)
+    }
+
     /// Internal API
     pub(crate) fn to_add(&self) -> Add {
         Add {
@@ -304,7 +333,7 @@ impl LogicalFileView {
             partition_values: self.partition_values_map(),
             size: self.size(),
             modification_time: self.modification_time(),
-            data_change: true,
+            data_change: self.data_change(),
             stats: self.stats(),
             tags: None,
             deletion_vector: self.deletion_vector().map(|dv| dv.descriptor()),
@@ -654,7 +683,9 @@ mod tests {
         let add_action = view.to_add();
         assert_eq!(add_action.path, view.path());
         assert_eq!(add_action.size, view.size());
-        assert!(add_action.data_change);
+        // When the scan row batch lacks the dataChange column (current kernel behaviour),
+        // to_add() should default to true — the conservative safe value.
+        assert!(add_action.data_change, "missing dataChange column should default to true");
 
         let remove_action = view.remove_action(true);
         assert_eq!(remove_action.path, view.path());
@@ -668,6 +699,79 @@ mod tests {
             object_meta.last_modified.timestamp_millis(),
             view.modification_time()
         );
+    }
+
+    /// Helper: build a minimal scan-row batch with a `dataChange` column set to `value`.
+    fn logical_file_view_with_data_change(value: bool) -> LogicalFileView {
+        use arrow::array::BooleanArray;
+        let base_schema: arrow_schema::Schema =
+            scan_row_schema().as_ref().try_into_arrow().unwrap();
+        let mut columns: Vec<ArrayRef> = base_schema
+            .fields()
+            .iter()
+            .map(|field| new_null_array(field.data_type(), 1))
+            .collect();
+        columns[base_schema.index_of("path").unwrap()] =
+            Arc::new(StringArray::from(vec![Some("part-000.parquet")]));
+        columns[base_schema.index_of("size").unwrap()] = Arc::new(Int64Array::from(vec![1]));
+        columns[base_schema.index_of("modificationTime").unwrap()] =
+            Arc::new(Int64Array::from(vec![1]));
+
+        let mut fields = base_schema.fields().to_vec();
+        fields.push(Arc::new(arrow_schema::Field::new(
+            FIELD_NAME_DATA_CHANGE,
+            ArrowDataType::Boolean,
+            true,
+        )));
+        columns.push(Arc::new(BooleanArray::from(vec![value])));
+
+        let batch =
+            RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns).unwrap();
+        LogicalFileView::new(batch, 0)
+    }
+
+    #[test]
+    fn test_data_change_accessor_reads_column_when_present() {
+        // When the scan row batch carries a top-level `dataChange` column, the accessor
+        // must return its value exactly.
+        let view_true = logical_file_view_with_data_change(true);
+        assert!(view_true.data_change(), "dataChange=true column must return true");
+        assert!(view_true.to_add().data_change, "to_add() must propagate true");
+
+        let view_false = logical_file_view_with_data_change(false);
+        assert!(
+            !view_false.data_change(),
+            "dataChange=false column must return false"
+        );
+        assert!(
+            !view_false.to_add().data_change,
+            "to_add() must propagate false (e.g. for OPTIMIZE-produced files)"
+        );
+    }
+
+    #[test]
+    fn test_data_change_defaults_to_true_when_column_absent() {
+        // When the scan row batch lacks the `dataChange` column (current kernel behaviour),
+        // the accessor must return `true` as a conservative default so existing callers
+        // that depend on the old hardcoded-true behaviour are not broken.
+        let base_schema: arrow_schema::Schema =
+            scan_row_schema().as_ref().try_into_arrow().unwrap();
+        let columns: Vec<ArrayRef> = base_schema
+            .fields()
+            .iter()
+            .map(|field| new_null_array(field.data_type(), 1))
+            .collect();
+        // Note: no dataChange column added to the batch.
+        let batch =
+            RecordBatch::try_new(Arc::new(base_schema), columns).unwrap();
+        let view = LogicalFileView::new(batch, 0);
+
+        assert!(
+            view.data_change(),
+            "absent dataChange column must default to true"
+        );
+        // to_add() also delegates to data_change(); verify via the accessor only to avoid
+        // panicking on the null path/size columns that are unrelated to this test.
     }
 
     #[test]
