@@ -213,9 +213,6 @@ class DeltaTable:
         table_uri: str | Path | os.PathLike[str],
         version: int | None = None,
         storage_options: dict[str, str] | None = None,
-        without_files: bool = False,
-        log_buffer_size: int | None = None,
-        skip_stats: bool = False,
     ) -> None:
         """
         Create the Delta Table from a path with an optional version.
@@ -270,9 +267,6 @@ class DeltaTable:
             str(table_uri),
             version=version,
             storage_options=storage_options,
-            without_files=without_files,
-            log_buffer_size=log_buffer_size,
-            skip_stats=skip_stats,
         )
 
     @property
