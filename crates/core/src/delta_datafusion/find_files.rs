@@ -173,6 +173,13 @@ impl TreeNodeVisitor<'_> for FindFilesExprProperties {
             | Expr::Case(_)
             | Expr::Cast(_)
             | Expr::TryCast(_) => (),
+            // Subquery expressions reference other tables and cannot be
+            // evaluated against file-level metadata. Allow them but mark
+            // the predicate as non-partition-only so the full DataFusion
+            // scan path is used instead of partition-based file skipping.
+            Expr::InSubquery(_) | Expr::Exists(_) | Expr::ScalarSubquery(_) => {
+                self.partition_only = false;
+            }
             Expr::ScalarFunction(scalar_function) => {
                 match scalar_function.func.signature().volatility {
                     Volatility::Immutable => (),

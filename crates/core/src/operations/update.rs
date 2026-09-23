@@ -488,6 +488,12 @@ impl std::future::IntoFuture for UpdateBuilder {
                 ));
             }
 
+            // Extract the original string predicate for the operation log before
+            // resolving, because fmt_expr_to_sql cannot unparse subquery Exprs.
+            let predicate_str = this.predicate.as_ref().and_then(|p| match p {
+                Expression::String(s) => Some(s.clone()),
+                Expression::DataFusion(_) => None,
+            });
             let predicate = this
                 .predicate
                 .map(|p| {
@@ -500,8 +506,18 @@ impl std::future::IntoFuture for UpdateBuilder {
                 .transpose()?;
 
             let predicate = predicate.unwrap_or(lit(true));
+
+            // Materialize any uncorrelated InSubquery nodes into InList so the
+            // predicate can be used as a row-level scalar expression in UPDATE.
+            let predicate = crate::delta_datafusion::expr::materialize_subqueries(
+                predicate, &state,
+            ).await?;
+
             let operation = DeltaOperation::Update {
-                predicate: Some(fmt_expr_to_sql(&predicate)?),
+                predicate: match predicate_str {
+                    Some(s) => Some(s),
+                    None => Some(fmt_expr_to_sql(&predicate)?),
+                },
             };
 
             let (actions, metrics) = execute(

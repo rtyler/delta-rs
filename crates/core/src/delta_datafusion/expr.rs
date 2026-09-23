@@ -233,8 +233,52 @@ impl<'a> DeltaContextProvider<'a> {
 }
 
 impl ContextProvider for DeltaContextProvider<'_> {
-    fn get_table_source(&self, _name: TableReference) -> DFResult<Arc<dyn TableSource>> {
-        unimplemented!()
+    fn get_table_source(&self, name: TableReference) -> DFResult<Arc<dyn TableSource>> {
+        use datafusion::datasource::provider_as_source;
+        // Delegate to the session catalog so that subquery expressions like
+        // `IN (SELECT ...)` or `EXISTS (...)` can reference tables registered
+        // on the caller's SessionContext.
+        //
+        // SchemaProvider::table() is async; bridge into sync context using the
+        // same pattern as crates/catalog-unity/src/lib.rs:499.
+        let schema = self.state.schema_for_ref(name.clone())?;
+        let table_name = name.table().to_string();
+        let provider_opt = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    let schema = Arc::clone(&schema);
+                    let n = table_name.clone();
+                    tokio::task::block_in_place(move || handle.block_on(schema.table(&n)))?
+                }
+                _ => {
+                    // current_thread runtime: block_in_place is not available;
+                    // spawn a real OS thread so the async work can proceed.
+                    let schema = Arc::clone(&schema);
+                    let n = table_name.clone();
+                    let mut result: Option<Option<Arc<dyn datafusion::catalog::TableProvider>>> =
+                        None;
+                    std::thread::scope(|scope| {
+                        scope.spawn(|| {
+                            result = Some(handle.block_on(schema.table(&n)).ok().flatten());
+                        });
+                    });
+                    result.flatten()
+                }
+            },
+            Err(_) => {
+                // No async runtime in scope -- spin up a minimal one.
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+                    .block_on(schema.table(&table_name))?
+            }
+        };
+        provider_opt
+            .map(provider_as_source)
+            .ok_or_else(|| datafusion::error::DataFusionError::Plan(format!(
+                "table '{name}' not found in session catalog"
+            )))
     }
 
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
@@ -643,6 +687,123 @@ impl Display for SqlFormat<'_> {
             _ => Err(fmt::Error),
         }
     }
+}
+
+/// Materialize any uncorrelated `InSubquery` nodes in `expr` by executing the
+/// inner plan and replacing it with an equivalent `InList`. This is needed for
+/// UPDATE and similar operations that evaluate the predicate as a row-level
+/// scalar expression: DataFusion's physical layer cannot evaluate `InSubquery`
+/// directly; it must be pre-executed into a literal list first.
+///
+/// Correlated subqueries and `Exists` are left unchanged.
+pub(crate) async fn materialize_subqueries(
+    expr: Expr,
+    session: &dyn datafusion::catalog::Session,
+) -> DeltaResult<Expr> {
+    use datafusion::common::tree_node::{Transformed, TreeNode as _};
+    use datafusion::physical_plan::collect as df_collect;
+
+    let state = crate::delta_datafusion::resolve_session_state(
+        Some(session),
+        crate::delta_datafusion::SessionFallbackPolicy::DeriveFromTrait,
+        || crate::delta_datafusion::create_session().state(),
+        crate::delta_datafusion::SessionResolveContext {
+            operation: "materialize_subqueries",
+            table_uri: None,
+            cdc: false,
+        },
+    )?
+    .0;
+
+    // Walk the expression tree, replacing each uncorrelated InSubquery with InList.
+    // We must use a sync transform because async closures in transform are not supported,
+    // so we gather replacements first via an apply pass, then substitute.
+    let mut replacements: Vec<Option<Vec<datafusion::common::ScalarValue>>> = vec![];
+
+    // First pass: count InSubquery nodes to know how many futures to execute.
+    expr.apply(|e| {
+        if let Expr::InSubquery(isq) = e {
+            if isq.subquery.outer_ref_columns.is_empty() {
+                replacements.push(None); // placeholder
+            }
+        }
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    })?;
+
+    // Execute each subquery.
+    let mut idx = 0usize;
+    let mut filled: Vec<Vec<datafusion::common::ScalarValue>> = vec![];
+    let mut count_idx = 0usize;
+    expr.apply(|e| {
+        if let Expr::InSubquery(isq) = e {
+            if isq.subquery.outer_ref_columns.is_empty() {
+                count_idx += 1;
+            }
+        }
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    })?;
+    // Re-collect: iterate another pass to execute.
+    // Use a simpler approach: collect all InSubquery plans first, then execute.
+    let mut plans: Vec<std::sync::Arc<datafusion::logical_expr::LogicalPlan>> = vec![];
+    let mut negated_flags: Vec<bool> = vec![];
+    let mut outer_exprs: Vec<Expr> = vec![];
+    expr.apply(|e| {
+        if let Expr::InSubquery(isq) = e {
+            if isq.subquery.outer_ref_columns.is_empty() {
+                plans.push(isq.subquery.subquery.clone());
+                negated_flags.push(isq.negated);
+                outer_exprs.push((*isq.expr).clone());
+            }
+        }
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    })?;
+
+    let mut value_lists: Vec<Vec<datafusion::common::ScalarValue>> = Vec::with_capacity(plans.len());
+    for plan in &plans {
+        let phys = state.create_physical_plan(plan).await
+            .map_err(|e| DeltaTableError::GenericError { source: Box::new(e) })?;
+        let batches = df_collect(phys, state.task_ctx())
+            .await
+            .map_err(|e| DeltaTableError::GenericError { source: Box::new(e) })?;
+        let mut values = vec![];
+        for batch in &batches {
+            if batch.num_columns() == 0 { continue; }
+            let col = batch.column(0);
+            for row in 0..col.len() {
+                let sv = datafusion::common::ScalarValue::try_from_array(col, row)
+                    .map_err(|e| DeltaTableError::GenericError { source: Box::new(e) })?;
+                values.push(sv);
+            }
+        }
+        value_lists.push(values);
+    }
+
+    // Second pass: replace InSubquery with InList using pre-computed value_lists.
+    let mut replace_idx = 0usize;
+    let result = expr.transform(|e| {
+        if let Expr::InSubquery(isq) = &e {
+            if isq.subquery.outer_ref_columns.is_empty() {
+                let values = &value_lists[replace_idx];
+                let negated = isq.negated;
+                let inner_expr = isq.expr.as_ref().clone();
+                let list: Vec<Expr> = values
+                    .iter()
+                    .map(|sv| Expr::Literal(sv.clone(), None))
+                    .collect();
+                replace_idx += 1;
+                return Ok(Transformed::yes(Expr::InList(
+                    datafusion::logical_expr::expr::InList {
+                        expr: Box::new(inner_expr),
+                        list,
+                        negated,
+                    },
+                )));
+            }
+        }
+        Ok(Transformed::no(e))
+    })?;
+
+    Ok(result.data)
 }
 
 /// Format an `Expr` to a parsable SQL expression
@@ -1513,5 +1674,101 @@ mod test {
                 "unexpected error: {err}"
             );
         }
+    }
+
+    // -- subquery predicate tests (issue #2668) --------------------------------
+
+    #[tokio::test]
+    async fn test_parse_predicate_in_subquery() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{
+            DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+        };
+        use arrow::record_batch::RecordBatch;
+        use datafusion::common::DFSchema;
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        use super::parse_predicate_expression;
+
+        let ctx = SessionContext::new();
+
+        // Register a helper table with a single INT32 column "value".
+        let filter_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let filter_batch = RecordBatch::try_new(
+            filter_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1i32, 3]))],
+        )
+        .unwrap();
+        ctx.register_table(
+            "filter_ids",
+            Arc::new(
+                MemTable::try_new(filter_schema.clone(), vec![vec![filter_batch]]).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        // Outer schema: one column "value" INT32.
+        let outer_df_schema = DFSchema::try_from(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Int32,
+            true,
+        )]))
+        .unwrap();
+
+        // IN (SELECT ...) must resolve without error when the table is registered.
+        let result = parse_predicate_expression(
+            &outer_df_schema,
+            "value IN (SELECT value FROM filter_ids)",
+            &ctx.state(),
+        );
+        assert!(
+            result.is_ok(),
+            "Expected IN subquery to parse successfully, got: {:?}",
+            result
+        );
+
+        // Non-subquery predicate must still work (regression guard).
+        let result2 = parse_predicate_expression(&outer_df_schema, "value = 42", &ctx.state());
+        assert!(
+            result2.is_ok(),
+            "Non-subquery predicate regressed: {:?}",
+            result2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_predicate_in_subquery_table_not_found() {
+        use arrow::datatypes::{
+            DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+        };
+        use datafusion::common::DFSchema;
+        use datafusion::prelude::SessionContext;
+
+        use super::parse_predicate_expression;
+
+        let ctx = SessionContext::new();
+        // No tables registered -- referencing a table must return Err, not panic.
+        let outer_df_schema = DFSchema::try_from(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Int32,
+            true,
+        )]))
+        .unwrap();
+
+        let result = parse_predicate_expression(
+            &outer_df_schema,
+            "value IN (SELECT value FROM nonexistent_table)",
+            &ctx.state(),
+        );
+        assert!(
+            result.is_err(),
+            "Expected Err when table is not registered, got Ok"
+        );
     }
 }

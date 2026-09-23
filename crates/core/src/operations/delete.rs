@@ -314,6 +314,12 @@ impl std::future::IntoFuture for DeleteBuilder {
             update_datafusion_session(&session, &this.log_store, Some(operation_id))?;
             session.ensure_log_store_registered(this.log_store.as_ref())?;
 
+            // Extract the original string predicate for the operation log before
+            // resolving, because fmt_expr_to_sql cannot unparse subquery Exprs.
+            let predicate_str = this.predicate.as_ref().and_then(|p| match p {
+                Expression::String(s) => Some(s.clone()),
+                Expression::DataFusion(_) => None,
+            });
             let predicate = this
                 .predicate
                 .map(|p| {
@@ -326,7 +332,10 @@ impl std::future::IntoFuture for DeleteBuilder {
                 .transpose()?;
 
             let operation = DeltaOperation::Delete {
-                predicate: predicate.as_ref().map(fmt_expr_to_sql).transpose()?,
+                predicate: match predicate_str {
+                    Some(s) => Some(s),
+                    None => predicate.as_ref().map(fmt_expr_to_sql).transpose()?,
+                },
             };
 
             let (actions, metrics) = execute(
@@ -2833,5 +2842,64 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_with_in_subquery_predicate() {
+        // Verifies that delete accepts `IN (SELECT ...)` predicates when the
+        // subquery table is registered in the supplied SessionContext (issue #2668).
+        use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+        use datafusion::datasource::MemTable;
+
+        // Build a table with rows: id in {A, A, B, B, C, C, A, B, C, A, B}
+        let table = setup_table(None).await;
+        let batch = get_record_batch(None, false);
+        let table = write_batch(table, batch).await;
+
+        // Register a small helper table "ids_to_delete" with one row: id = "B"
+        let filter_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        let filter_batch = arrow::record_batch::RecordBatch::try_new(
+            filter_schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["B"]))],
+        )
+        .unwrap();
+        let mem = Arc::new(
+            MemTable::try_new(filter_schema, vec![vec![filter_batch]]).unwrap(),
+        );
+
+        // Use create_session() so the DeltaPlanner extension planner is registered.
+        let ctx = create_session().into_inner();
+        table.update_datafusion_session(&ctx.state()).unwrap();
+        ctx.register_table("ids_to_delete", mem).unwrap();
+
+        let (table, metrics) = table
+            .delete()
+            .with_predicate("id IN (SELECT id FROM ids_to_delete)")
+            .with_session_state(Arc::new(ctx.state()))
+            .await
+            .unwrap();
+
+        // get_record_batch(None, false) has id="B" in 4 rows.
+        assert!(
+            metrics.num_deleted_rows.unwrap_or(0) > 0,
+            "Expected rows with id='B' to be deleted"
+        );
+
+        // Verify no "B" rows remain.
+        use arrow_array::Array as _;
+        let data = get_data(&table).await;
+        for batch in &data {
+            if let Some(col) = batch.column_by_name("id") {
+                if let Some(id_arr) = col.as_any().downcast_ref::<arrow_array::StringViewArray>() {
+                    for i in 0..id_arr.len() {
+                        assert_ne!(id_arr.value(i), "B", "Row with id='B' should be deleted");
+                    }
+                }
+            }
+        }
     }
 }

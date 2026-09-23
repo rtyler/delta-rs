@@ -958,3 +958,61 @@ async fn test_update_cdc_enabled_partitions() {
     "+-------+------+------------------+-----------------+",
     ], &batches }
 }
+
+#[tokio::test]
+async fn test_update_with_in_subquery_predicate() {
+    // Verifies that update accepts `IN (SELECT ...)` predicates when the
+    // subquery table is registered in the supplied SessionContext (issue #2668).
+    use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow::record_batch::RecordBatch;
+    use arrow_array::Array as _;
+    use crate::delta_datafusion::create_session;
+    use datafusion::datasource::MemTable;
+
+    // Table: value column INT32 with [Some(0), None, Some(2), None, Some(4)]
+    let table = prepare_values_table().await;
+
+    // Register a helper table: values_to_negate = [0, 4]
+    let filter_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "value",
+        ArrowDataType::Int32,
+        false,
+    )]));
+    let filter_batch = RecordBatch::try_new(
+        filter_schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![0i32, 4]))],
+    )
+    .unwrap();
+    let mem = Arc::new(MemTable::try_new(filter_schema, vec![vec![filter_batch]]).unwrap());
+
+    // Use create_session() so DeltaPlanner is registered.
+    let ctx = create_session().into_inner();
+    table.update_datafusion_session(&ctx.state()).unwrap();
+    ctx.register_table("values_to_negate", mem).unwrap();
+
+    let (table, metrics) = table
+        .update()
+        .with_predicate("value IN (SELECT value FROM values_to_negate)")
+        .with_session_state(Arc::new(ctx.state()))
+        .with_update("value", "-1")
+        .await
+        .unwrap();
+
+    assert_eq!(metrics.num_updated_rows, 2, "Expected rows 0 and 4 to be updated to -1");
+
+    // Verify the values: 0 and 4 are now -1; others unchanged.
+    let data = get_data(&table).await;
+    let mut found_neg1 = 0usize;
+    for batch in &data {
+        if let Some(col) = batch.column_by_name("value") {
+            if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) && arr.value(i) == -1 {
+                        found_neg1 += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(found_neg1, 2, "Expected exactly 2 rows updated to -1");
+}
